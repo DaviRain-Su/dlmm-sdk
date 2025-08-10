@@ -37,7 +37,7 @@ pub async fn get_or_create_ata(
             &program_id,
         );
 
-        let signature = send_tx(&[create_ata_ix], rpc_client, &[], payer).await?;
+        let signature = send_tx(&[create_ata_ix], rpc_client, &[payer], payer).await?;
         println!("Create ata {token_mint} {wallet_address} {signature}");
     }
 
@@ -62,15 +62,24 @@ pub async fn send_tx(
     keypairs: &[&Keypair],
     payer: &Keypair,
 ) -> Result<Signature> {
+    println!("send_tx: {} instructions, {} keypairs, payer: {}", 
+        instructions.len(), 
+        keypairs.len(), 
+        payer.pubkey());
+    
+    // 打印所有签名者
+    for (i, kp) in keypairs.iter().enumerate() {
+        println!("  Keypair {}: {}", i, kp.pubkey());
+    }
+    
     let latest_blockhash = rpc_client.get_latest_blockhash().await?;
 
-    let mut tx = Transaction::new_signed_with_payer(
+    let tx = Transaction::new_signed_with_payer(
         instructions,
         Some(&payer.pubkey()),
         keypairs,
         latest_blockhash,
     );
-    tx.sign(&[payer], latest_blockhash);
 
     let signature = rpc_client.send_and_confirm_transaction(&tx).await?;
 

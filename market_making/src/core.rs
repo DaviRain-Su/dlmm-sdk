@@ -3,10 +3,12 @@ use crate::*;
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 use anchor_spl::token_interface::Mint;
 use anchor_spl::token_interface::TokenAccount;
+use anchor_spl::token;
 use compute_budget::ComputeBudgetInstruction;
 use dlmm::events::Swap as SwapEvent;
 use instruction::AccountMeta;
 use instruction::Instruction;
+use solana_sdk::system_instruction;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -122,6 +124,14 @@ impl Core {
 
     pub async fn fetch_token_info(&self) -> Result<()> {
         let token_mints_with_program = self.get_all_token_mints_with_program_id()?;
+        
+        info!("Fetching token info for pairs...");
+        for (mint, program) in &token_mints_with_program {
+            info!("Token mint: {}, Program: {}", mint, program);
+            if *mint == token::spl_token::native_mint::id() {
+                info!("  -> This is Wrapped SOL (WSOL)");
+            }
+        }
 
         let token_mint_keys = token_mints_with_program
             .iter()
@@ -171,7 +181,8 @@ impl Core {
         if let Some(wallet) = self.wallet.as_ref() {
             let rpc_client = self.rpc_client();
             for (token_mint, program_id) in self.get_all_token_mints_with_program_id()?.iter() {
-                get_or_create_ata(
+                // 创建ATA账户
+                let ata = get_or_create_ata(
                     &rpc_client,
                     *token_mint,
                     *program_id,
@@ -179,9 +190,56 @@ impl Core {
                     wallet,
                 )
                 .await?;
+                
+                // 如果是WSOL且余额为0，自动包装一些SOL
+                if *token_mint == token::spl_token::native_mint::id() {
+                    let ata_account = rpc_client.get_account(&ata).await?;
+                    let token_account = TokenAccount::try_deserialize(&mut ata_account.data.as_ref())?;
+                    
+                    if token_account.amount == 0 {
+                        info!("Wrapping SOL to WSOL...");
+                        // 获取配置中需要的X代币数量
+                        let mut needed_amount = 0u64;
+                        for pair_config in &self.config {
+                            needed_amount = needed_amount.max(pair_config.x_amount);
+                        }
+                        
+                        if needed_amount > 0 {
+                            self.wrap_sol(needed_amount).await?;
+                        }
+                    }
+                }
             }
         }
 
+        Ok(())
+    }
+    
+    async fn wrap_sol(&self, amount: u64) -> Result<()> {
+        let wallet = self.wallet.clone().context("Require keypair")?;
+        let rpc_client = self.rpc_client();
+        
+        let wsol_account = get_associated_token_address_with_program_id(
+            &wallet.pubkey(),
+            &token::spl_token::native_mint::id(),
+            &token::ID,
+        );
+        
+        // 同步原生SOL到WSOL账户
+        let sync_native_ix = token::spl_token::instruction::sync_native(&token::ID, &wsol_account)?;
+        
+        // 转账SOL到WSOL账户
+        let transfer_ix = system_instruction::transfer(
+            &wallet.pubkey(),
+            &wsol_account,
+            amount,
+        );
+        
+        let instructions = vec![transfer_ix, sync_native_ix];
+        
+        let signature = send_tx(&instructions, &rpc_client, &[&wallet], &wallet).await?;
+        info!("Wrapped {} SOL to WSOL: {}", amount as f64 / 1e9 as f64, signature);
+        
         Ok(())
     }
 
@@ -345,7 +403,7 @@ impl Core {
                     simulate_transaction(&instructions, &rpc_client, &[], payer.pubkey()).await?;
                 println!("{:?}", response);
             } else {
-                let signature = send_tx(&instructions, &rpc_client, &[], &payer).await?;
+                let signature = send_tx(&instructions, &rpc_client, &[&payer], &payer).await?;
                 info!("Close position {position} {signature}");
             }
         }
@@ -488,7 +546,7 @@ impl Core {
             return Ok(None);
         }
 
-        let signature = send_tx(&instructions, &rpc_client, &[], &payer).await?;
+        let signature = send_tx(&instructions, &rpc_client, &[&payer], &payer).await?;
         info!("Swap {amount_in} {swap_for_y} {signature}");
 
         // TODO should handle if cannot get swap event
@@ -651,7 +709,7 @@ impl Core {
                 amount_x,
                 amount_y,
                 active_id: lb_pair_state.active_id,
-                max_active_bin_slippage: 3,
+                max_active_bin_slippage: 10,  // 增加滑点容忍度
                 strategy_parameters: StrategyParameters {
                     min_bin_id: lower_bin_id,
                     max_bin_id: upper_bin_id,
@@ -684,8 +742,8 @@ impl Core {
 
             info!("Deposit {amount_x} {amount_y} {position} {:?}", simulate_tx);
         } else {
-            let signature = send_tx(&instructions, &rpc_client, &[&position_kp], &payer).await?;
-            info!("deposit {amount_x} {amount_y} {position} {signature}");
+            let signature = send_tx(&instructions, &rpc_client, &[&position_kp, &payer], &payer).await?;
+            info!("deposit success: amount_x={amount_x} amount_y={amount_y} position={position} signature={signature}");
         }
 
         Ok(())
@@ -729,18 +787,24 @@ impl Core {
             TokenAccount::try_deserialize(&mut user_token_y_account.data.as_ref())?;
 
         // compare with current balance
+        info!("Wallet balances - X: {}, Y: {}", user_token_x_state.amount, user_token_y_state.amount);
+        info!("Requested amounts - X: {}, Y: {}", amount_x, amount_y);
+        
         let amount_x = if amount_x > user_token_x_state.amount {
+            info!("X amount {} exceeds balance {}, using balance", amount_x, user_token_x_state.amount);
             user_token_x_state.amount
         } else {
             amount_x
         };
 
         let amount_y = if amount_y > user_token_y_state.amount {
+            info!("Y amount {} exceeds balance {}, using balance", amount_y, user_token_y_state.amount);
             user_token_y_state.amount
         } else {
             amount_y
         };
 
+        info!("Final deposit amounts - X: {}, Y: {}", amount_x, amount_y);
         Ok((amount_x, amount_y))
     }
 
@@ -764,6 +828,15 @@ impl Core {
             let pair_config = get_pair_config(&self.config, position.lb_pair);
             // check whether out of price range
             let lb_pair_state = &position.lb_pair_state.context("Missing lb pair state")?;
+            
+            info!(
+                "Pair {}: active_id={}, min_bin={}, max_bin={}, mode={:?}", 
+                position.lb_pair, 
+                lb_pair_state.active_id,
+                position.min_bin_id,
+                position.max_bin_id,
+                pair_config.mode
+            );
             if pair_config.mode == MarketMakingMode::ModeRight
                 && lb_pair_state.active_id > position.max_bin_id
             {
@@ -847,6 +920,7 @@ impl Core {
         info!("shift left {}", state.lb_pair);
         // validate that y amount is zero
         let position = state.get_positions()?;
+        info!("Current position before shift: x={}, y={}", position.amount_x, position.amount_y);
         if position.amount_y != 0 {
             return Err(Error::msg("Amount y is not zero"));
         }
@@ -875,7 +949,8 @@ impl Core {
 
         // sanity check with real balances
         let (amount_x, amount_y) = self.get_deposit_amount(state, amount_x, amount_y).await?;
-        info!("deposit {}", state.lb_pair);
+        info!("deposit {} - amounts after balance check: x={}, y={}, active_id={}", 
+            state.lb_pair, amount_x, amount_y, lb_pair_state.active_id);
         match self
             .deposit(state, amount_x, amount_y, lb_pair_state.active_id, false)
             .await
