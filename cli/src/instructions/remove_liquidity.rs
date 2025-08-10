@@ -1,19 +1,38 @@
 use crate::*;
 use instructions::*;
 
+/// 移除流动性参数
 #[derive(Debug, Parser)]
 pub struct RemoveLiquidityParams {
     /// Address of the liquidity pair.
+    /// 流动性对地址
     pub lb_pair: Pubkey,
     /// Bin liquidity information to be remove. "<BIN_ID,BPS_TO_REMOVE, BIN_ID,BPS_TO_REMOVE, ...>" where
     /// BIN_ID = bin id to withdraw
     /// BPS_TO_REMOVE = Percentage of position owned share to be removed. Maximum is 1.0f, which equivalent to 100%.
+    /// 
+    /// 要移除的bin流动性信息。格式："<BIN_ID,BPS_TO_REMOVE, ...>"
+    /// BIN_ID = 要提取的bin ID
+    /// BPS_TO_REMOVE = 要移除的仓位份额百分比。最大值1.0，等同于100%
     #[clap(long, value_parser = parse_bin_liquidity_removal, value_delimiter = ' ', allow_hyphen_values = true)]
     pub bin_liquidity_removal: Vec<(i32, f64)>,
     /// Position to be withdraw.
+    /// 要提取的仓位
     pub position: Pubkey,
 }
 
+/// 执行移除流动性操作
+/// 
+/// # 参数
+/// * `params` - 移除流动性参数
+/// * `program` - Anchor程序客户端
+/// * `transaction_config` - 交易配置
+/// * `compute_unit_price` - 计算单元价格指令（可选）
+/// 
+/// # 功能
+/// 1. 验证要移除的bin范围
+/// 2. 获取仓位和流动性对状态
+/// 3. 计算并提取流动性到用户账户
 pub async fn execute_remove_liquidity<C: Deref<Target = impl Signer> + Clone>(
     params: RemoveLiquidityParams,
     program: &Program<C>,
@@ -26,10 +45,12 @@ pub async fn execute_remove_liquidity<C: Deref<Target = impl Signer> + Clone>(
         mut bin_liquidity_removal,
     } = params;
 
+    // 按bin ID排序，确保从低到高
     bin_liquidity_removal.sort_by(|a, b| a.0.cmp(&b.0));
 
     let rpc_client = program.rpc();
 
+    // 批量获取流动性对和仓位账户
     let mut accounts = rpc_client
         .get_multiple_accounts(&[lb_pair, position])
         .await?;
@@ -37,9 +58,11 @@ pub async fn execute_remove_liquidity<C: Deref<Target = impl Signer> + Clone>(
     let lb_pair_account = accounts[0].take().context("lb_pair not found")?;
     let position_account = accounts[1].take().context("position not found")?;
 
+    // 反序列化账户状态
     let lb_pair_state: LbPair = bytemuck::pod_read_unaligned(&lb_pair_account.data[8..]);
     let position_state: PositionV2 = bytemuck::pod_read_unaligned(&position_account.data[8..]);
 
+    // 获取最小和最大bin ID，用于确定需要的bin数组范围
     let min_bin_id = bin_liquidity_removal
         .first()
         .map(|(bin_id, _)| *bin_id)
@@ -50,6 +73,7 @@ pub async fn execute_remove_liquidity<C: Deref<Target = impl Signer> + Clone>(
         .map(|(bin_id, _)| *bin_id)
         .context("bin_liquidity_removal is empty")?;
 
+    // 获取覆盖所需bin范围的bin数组账户元数据
     let bin_arrays_account_meta =
         position_state.get_bin_array_accounts_meta_coverage_by_chunk(min_bin_id, max_bin_id)?;
 
