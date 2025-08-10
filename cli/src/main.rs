@@ -1,3 +1,4 @@
+// 导入必要的依赖
 use anchor_client::solana_sdk::compute_budget::ComputeBudgetInstruction;
 use anchor_client::solana_sdk::instruction::Instruction;
 use anchor_client::*;
@@ -24,15 +25,25 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::time::Duration;
 
-mod args;
-mod instructions;
-mod math;
+// 模块声明
+mod args;         // 命令行参数定义
+mod instructions; // 指令实现
+mod math;        // 数学计算工具
 
 use args::*;
 use commons::rpc_client_extension::*;
 use instructions::*;
 use math::*;
 
+/// 获取设置计算单元价格的指令
+/// 用于设置交易的优先费用，提高交易被打包的概率
+/// 
+/// # 参数
+/// * `micro_lamports` - 每个计算单元的价格（以micro lamports为单位）
+/// 
+/// # 返回
+/// * 如果价格大于0，返回设置计算单元价格的指令
+/// * 如果价格为0，返回None（不设置优先费用）
 fn get_set_compute_unit_price_ix(micro_lamports: u64) -> Option<Instruction> {
     if micro_lamports > 0 {
         Some(ComputeBudgetInstruction::set_compute_unit_price(
@@ -43,39 +54,53 @@ fn get_set_compute_unit_price_ix(micro_lamports: u64) -> Option<Instruction> {
     }
 }
 
+/// 主函数入口
+/// 使用tokio异步运行时处理所有命令
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 解析命令行参数
     let cli = Cli::parse();
 
+    // 读取钱包密钥对文件
     let payer =
         read_keypair_file(cli.config_override.wallet).expect("Wallet keypair file not found");
 
+    // 打印钱包公钥
     println!("Wallet {:#?}", payer.pubkey());
 
+    // 设置确认级别为confirmed
+    // confirmed表示交易已被集群中大多数节点确认
     let commitment_config = CommitmentConfig::confirmed();
 
+    // 创建Anchor客户端，用于与Solana区块链交互
     let client = Client::new_with_options(
         cli.config_override.cluster,
         Rc::new(Keypair::from_bytes(&payer.to_bytes())?),
         commitment_config,
     );
 
+    // 获取DLMM程序客户端
     let program = client.program(dlmm::ID)?;
 
+    // 配置交易发送选项
     let transaction_config: RpcSendTransactionConfig = RpcSendTransactionConfig {
-        skip_preflight: false,
-        preflight_commitment: Some(commitment_config.commitment),
-        encoding: None,
-        max_retries: None,
-        min_context_slot: None,
+        skip_preflight: false,        // 不跳过预检
+        preflight_commitment: Some(commitment_config.commitment), // 预检确认级别
+        encoding: None,               // 使用默认编码
+        max_retries: None,            // 使用默认重试次数
+        min_context_slot: None,       // 不设置最小上下文槽位
     };
 
+    // 根据用户设置创建计算单元价格指令（优先费用）
     let compute_unit_price_ix = get_set_compute_unit_price_ix(cli.config_override.priority_fee);
 
+    // 根据用户输入的命令执行相应的操作
     match cli.command {
+        // 初始化流动性对（版本2）
         DLMMCommand::InitializePair2(params) => {
             execute_initialize_lb_pair2(params, &program, transaction_config).await?;
         }
+        // 初始化流动性对（版本1）
         DLMMCommand::InitializePair(params) => {
             execute_initialize_lb_pair(params, &program, transaction_config).await?;
         }
@@ -165,8 +190,11 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        // 由操作员播种流动性
+        // 包含重试机制，用于处理网络错误或交易失败
         DLMMCommand::SeedLiquidityByOperator(params) => {
             let mut retry_count = 0;
+            // 循环重试直到成功或达到最大重试次数
             while let Err(err) = execute_seed_liquidity_by_operator(
                 params.clone(),
                 &program,
@@ -181,6 +209,7 @@ async fn main() -> Result<()> {
                     println!("Exceeded max retries {}", params.max_retries);
                     break;
                 }
+                // 等待16秒后重试（约一个区块时间）
                 tokio::time::sleep(Duration::from_secs(16)).await;
             }
         }
@@ -202,7 +231,9 @@ async fn main() -> Result<()> {
         DLMMCommand::SyncPrice(params) => {
             execute_sync_price(params, &program, transaction_config, compute_unit_price_ix).await?;
         }
+        // 管理员命令处理
         DLMMCommand::Admin(command) => match command {
+            // 初始化需要权限的流动性对
             AdminCommand::InitializePermissionPair(params) => {
                 execute_initialize_permission_lb_pair(params, &program, transaction_config).await?;
             }

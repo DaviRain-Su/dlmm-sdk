@@ -1,17 +1,32 @@
 use crate::*;
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 
+/// 精确输入数量的交易参数
 #[derive(Debug, Parser)]
 pub struct SwapExactInParams {
     /// Address of the liquidity pair.
+    /// 流动性对地址
     pub lb_pair: Pubkey,
     /// Amount of token to be sell.
+    /// 要卖出的代币数量（精确输入）
     pub amount_in: u64,
     /// Buy direction. true = buy token Y, false = buy token X.
+    /// 交易方向：true = 用X代币买Y代币，false = 用Y代币买X代币
     #[clap(long)]
     pub swap_for_y: bool,
 }
 
+/// 执行精确输入的交易
+/// 
+/// # 参数
+/// * `params` - 交易参数
+/// * `program` - Anchor程序客户端
+/// * `transaction_config` - 交易配置
+/// 
+/// # 功能
+/// 1. 获取流动性对状态
+/// 2. 计算交易报价
+/// 3. 构建并发送交易
 pub async fn execute_swap<C: Deref<Target = impl Signer> + Clone>(
     params: SwapExactInParams,
     program: &Program<C>,
@@ -25,14 +40,17 @@ pub async fn execute_swap<C: Deref<Target = impl Signer> + Clone>(
 
     let rpc_client = program.rpc();
 
+    // 获取流动性对的状态
     let lb_pair_state: LbPair = rpc_client
         .get_account_and_deserialize(&lb_pair, |account| {
             Ok(bytemuck::pod_read_unaligned(&account.data[8..]))
         })
         .await?;
 
+    // 获取代币程序（支持Token和Token2022）
     let [token_x_program, token_y_program] = lb_pair_state.get_token_programs()?;
 
+    // 根据交易方向确定输入和输出代币账户
     let (user_token_in, user_token_out) = if swap_for_y {
         (
             get_associated_token_address_with_program_id(
@@ -61,6 +79,7 @@ pub async fn execute_swap<C: Deref<Target = impl Signer> + Clone>(
         )
     };
 
+    // 获取bin数组位图扩展（用于优化bin查找）
     let (bitmap_extension_key, _bump) = derive_bin_array_bitmap_extension(lb_pair);
 
     let bitmap_extension = rpc_client
@@ -70,6 +89,8 @@ pub async fn execute_swap<C: Deref<Target = impl Signer> + Clone>(
         .await
         .ok();
 
+    // 获取交易所需的bin数组公钥
+    // 参数3表示获取3个bin数组，用于覆盖可能的交易范围
     let bin_arrays_for_swap = get_bin_array_pubkeys_for_swap(
         lb_pair,
         &lb_pair_state,
