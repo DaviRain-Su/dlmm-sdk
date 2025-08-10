@@ -3,24 +3,30 @@ use anchor_lang::AccountDeserialize;
 use anchor_spl::token_interface::Mint;
 use instructions::*;
 
+/// 按价格范围移除流动性的参数结构体
+/// Parameters for removing liquidity by price range
 #[derive(Debug, Parser)]
 pub struct RemoveLiquidityByPriceRangeParameters {
-    /// Address of the pair
+    /// 流动性对的地址 / Address of the liquidity pair
     pub lb_pair: Pubkey,
-    // base position path
+    /// 基础头寸密钥 / Base position key
     pub base_position_key: Pubkey,
-    /// min price
+    /// 最小价格 / Minimum price
     pub min_price: f64,
-    /// max price
+    /// 最大价格 / Maximum price
     pub max_price: f64,
 }
 
+/// 执行按价格范围移除流动性
+/// Execute removing liquidity by price range
 pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Signer> + Clone>(
     params: RemoveLiquidityByPriceRangeParameters,
     program: &Program<C>,
     transaction_config: RpcSendTransactionConfig,
     compute_unit_price: Option<Instruction>,
 ) -> Result<()> {
+    // 解构参数
+    // Destructure parameters
     let RemoveLiquidityByPriceRangeParameters {
         lb_pair,
         base_position_key,
@@ -30,15 +36,21 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
 
     let rpc_client = program.rpc();
 
+    // 获取流动性对状态
+    // Get liquidity pair state
     let lb_pair_state: LbPair = rpc_client
         .get_account_and_deserialize(&lb_pair, |account| {
             Ok(bytemuck::pod_read_unaligned(&account.data[8..]))
         })
         .await?;
 
+    // 获取bin步长和代币程序
+    // Get bin step and token programs
     let bin_step = lb_pair_state.bin_step;
     let [token_x_program, token_y_program] = lb_pair_state.get_token_programs()?;
 
+    // 获取代币铸币账户信息
+    // Get token mint account information
     let mut accounts = rpc_client
         .get_multiple_accounts(&[lb_pair_state.token_x_mint, lb_pair_state.token_y_mint])
         .await?;
@@ -49,6 +61,8 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
     let token_mint_base = Mint::try_deserialize(&mut token_mint_base_account.data.as_ref())?;
     let token_mint_quote = Mint::try_deserialize(&mut token_mint_quote_account.data.as_ref())?;
 
+    // 将最小价格转换为每lamport价格并计算对应的bin ID
+    // Convert min price to per-lamport price and calculate corresponding bin ID
     let min_price_per_lamport = price_per_token_to_per_lamport(
         min_price,
         token_mint_base.decimals,
@@ -59,6 +73,8 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
     let min_active_id = get_id_from_price(bin_step, &min_price_per_lamport, Rounding::Up)
         .context("get_id_from_price overflow")?;
 
+    // 将最大价格转换为每lamport价格并计算对应的bin ID
+    // Convert max price to per-lamport price and calculate corresponding bin ID
     let max_price_per_lamport = price_per_token_to_per_lamport(
         max_price,
         token_mint_base.decimals,
@@ -69,8 +85,12 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
     let max_active_id = get_id_from_price(bin_step, &max_price_per_lamport, Rounding::Up)
         .context("get_id_from_price overflow")?;
 
+    // 验证价格范围有效
+    // Verify price range is valid
     assert!(min_active_id < max_active_id);
 
+    // 获取或创建用户的X代币账户
+    // Get or create user's X token account
     let user_token_x = get_or_create_ata(
         program,
         transaction_config,
@@ -80,6 +100,8 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
     )
     .await?;
 
+    // 获取或创建用户的Y代币账户
+    // Get or create user's Y token account
     let user_token_y = get_or_create_ata(
         program,
         transaction_config,
@@ -116,11 +138,19 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
         transfer_hook_remaining_accounts.extend(remaining_accounts);
     };
 
+    // 遍历价格范围内的所有bin ID
+    // Iterate through all bin IDs in the price range
     for i in min_active_id..=max_active_id {
+        // 派生头寸PDA地址
+        // Derive position PDA address
         let (position, _bump) = derive_position_pda(lb_pair, base_position_key, i, width);
 
+        // 获取头寸账户
+        // Get position account
         let position_account = rpc_client.get_account(&position).await;
         if let std::result::Result::Ok(account) = position_account {
+            // 解析头寸状态
+            // Parse position state
             let position_state: PositionV2 = bytemuck::pod_read_unaligned(&account.data[8..]);
 
             let bin_arrays_account_meta = position_state.get_bin_array_accounts_meta_coverage()?;
@@ -131,9 +161,13 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
             ]
             .concat();
 
+            // 设置计算单元限制
+            // Set compute unit limit
             let mut instructions =
                 vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
 
+            // 创建移除流动性指令
+            // Create remove liquidity instruction
             let main_accounts = dlmm::client::accounts::RemoveLiquidityByRange2 {
                 position,
                 lb_pair,
@@ -171,6 +205,8 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
 
             instructions.push(withdraw_all_ix);
 
+            // 创建申领费用指令
+            // Create claim fee instruction
             let main_accounts = dlmm::client::accounts::ClaimFee2 {
                 lb_pair,
                 position,
@@ -206,6 +242,8 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
 
             instructions.push(claim_fee_ix);
 
+            // 创建关闭头寸指令
+            // Create close position instruction
             let accounts = dlmm::client::accounts::ClosePosition2 {
                 position,
                 sender: program.payer(),
@@ -225,6 +263,8 @@ pub async fn execute_remove_liquidity_by_price_range<C: Deref<Target = impl Sign
 
             instructions.push(close_position_ix);
 
+            // 打印关闭头寸信息
+            // Print position closing information
             println!(
                 "Close position {}. Min bin id {}, Max bin id {}",
                 position, position_state.lower_bin_id, position_state.upper_bin_id

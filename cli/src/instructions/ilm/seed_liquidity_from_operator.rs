@@ -10,7 +10,11 @@ use anchor_spl::{
 use futures_util::future::try_join_all;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 
+/// 将代币数量转换为最小单位（Wei）
+/// Convert token amount to smallest unit (Wei)
 pub fn to_wei_amount(amount: u64, decimal: u8) -> Result<u64> {
+    // 乘以10的小数位数次方来转换为最小单位
+    // Multiply by 10^decimal to convert to smallest unit
     let wei_amount = amount
         .checked_mul(10u64.pow(decimal.into()))
         .context("to_wei_amount overflow")?;
@@ -18,6 +22,8 @@ pub fn to_wei_amount(amount: u64, decimal: u8) -> Result<u64> {
     Ok(wei_amount)
 }
 
+/// 将用户界面价格范围转换为相应的bin ID范围
+/// Convert UI price range to corresponding bin ID range
 pub fn convert_min_max_ui_price_to_min_max_bin_id(
     bin_step: u16,
     min_price: f64,
@@ -25,27 +31,41 @@ pub fn convert_min_max_ui_price_to_min_max_bin_id(
     base_token_decimal: u8,
     quote_token_decimal: u8,
 ) -> Result<(i32, i32)> {
+    // 将最小价格转换为每lamport价格
+    // Convert min price to per-lamport price
     let min_price_per_lamport =
         price_per_token_to_per_lamport(min_price, base_token_decimal, quote_token_decimal)
             .context("price_per_token_to_per_lamport overflow")?;
 
+    // 从价格获取最小活跃ID
+    // Get min active ID from price
     let min_active_id = get_id_from_price(bin_step, &min_price_per_lamport, Rounding::Up)
         .context("get_id_from_price overflow")?;
 
+    // 将最大价格转换为每lamport价格
+    // Convert max price to per-lamport price
     let max_price_per_lamport =
         price_per_token_to_per_lamport(max_price, base_token_decimal, quote_token_decimal)
             .context("price_per_token_to_per_lamport overflow")?;
 
+    // 从价格获取最大活跃ID
+    // Get max active ID from price
     let max_active_id = get_id_from_price(bin_step, &max_price_per_lamport, Rounding::Up)
         .context("get_id_from_price overflow")?;
 
     Ok((min_active_id, max_active_id))
 }
 
+/// 根据bin步长获取基础值
+/// Get base value from bin step
 fn get_base(bin_step: u16) -> f64 {
+    // 基础值 = 1 + bin_step/10000, 用于价格计算
+    // Base value = 1 + bin_step/10000, used for price calculations
     1.0 + bin_step as f64 / 10_000.0
 }
 
+/// 从bin ID获取用户界面价格
+/// Get UI price from bin ID
 pub fn get_ui_price_from_id(
     bin_step: u16,
     bin_id: i32,
@@ -53,19 +73,31 @@ pub fn get_ui_price_from_id(
     quote_token_decimal: i32,
 ) -> f64 {
     let base = get_base(bin_step);
+    // 价格 = 基础值^bin_id * 10^(基础代币小数位-报价代币小数位)
+    // Price = base^bin_id * 10^(base_token_decimal - quote_token_decimal)
     base.powi(bin_id) * 10.0f64.powi(base_token_decimal - quote_token_decimal)
 }
 
+/// 获取覆盖指定范围所需的头寸数量
+/// Get number of positions required to cover the specified range
 pub fn get_number_of_position_required_to_cover_range(
     min_bin_id: i32,
     max_bin_id: i32,
 ) -> Result<i32> {
+    // 计算bin ID的差值
+    // Calculate the difference between bin IDs
     let bin_delta = max_bin_id
         .checked_sub(min_bin_id)
         .context("bin_delta overflow")?;
+        
+    // 计算需要的头寸数量（每个头寸包含DEFAULT_BIN_PER_POSITION个bin）
+    // Calculate required positions (each position contains DEFAULT_BIN_PER_POSITION bins)
     let mut position_required = bin_delta
         .checked_div(DEFAULT_BIN_PER_POSITION as i32)
         .context("position_required overflow")?;
+        
+    // 如果有余数，需要额外的头寸
+    // If there's a remainder, need an additional position
     let rem = bin_delta % DEFAULT_BIN_PER_POSITION as i32;
 
     if rem > 0 {
@@ -75,20 +107,29 @@ pub fn get_number_of_position_required_to_cover_range(
     Ok(position_required)
 }
 
+/// 压缩结果结构体
+/// Compression result structure
 struct CompressionResult {
+    /// 压缩后的bin数量映射 / Compressed bin amount mapping
     compressed_bin_amount: HashMap<i32, u32>,
+    /// 压缩损失 / Compression loss
     compression_loss: u64,
 }
 
+/// 压缩bin数量以适应存储限制
+/// Compress bin amounts to fit storage limitations
 fn compress_bin_amount(
     bins_amount: HashMap<i32, u64>,
     multiplier: u64,
 ) -> Result<CompressionResult> {
     let mut compressed_bin_amount = HashMap::new();
-
     let mut compression_loss = 0u64;
 
+    // 遍历每个bin的数量并进行压缩
+    // Iterate through each bin amount and compress
     for (bin_id, amount) in bins_amount.into_iter() {
+        // 通过除法压缩数量到u32范围
+        // Compress amount to u32 range by division
         let compressed_amount: u32 = amount
             .checked_div(multiplier)
             .context("overflow")?
@@ -96,6 +137,8 @@ fn compress_bin_amount(
             .context("compressed fail")?;
         compressed_bin_amount.insert(bin_id, compressed_amount);
 
+        // 计算压缩损失
+        // Calculate compression loss
         let loss = amount
             .checked_sub(
                 u64::from(compressed_amount)
@@ -113,49 +156,55 @@ fn compress_bin_amount(
     })
 }
 
+/// 操作员播种流动性的参数结构体
+/// Seed liquidity by operator parameters structure
 #[derive(Debug, Parser, Clone)]
 pub struct SeedLiquidityByOperatorParameters {
-    /// Address of the pair
+    /// 流动性对的地址 / Address of the liquidity pair
     #[clap(long)]
     pub lb_pair: Pubkey,
-    /// Base position path
+    /// 基础头寸路径 / Base position path
     #[clap(long)]
     pub base_position_path: String,
-    /// Amount of x
+    /// X代币的数量 / Amount of X token
     #[clap(long)]
     pub amount: u64,
-    /// Min price
+    /// 最小价格 / Minimum price
     #[clap(long)]
     pub min_price: f64,
-    /// Max price
+    /// 最大价格 / Maximum price
     #[clap(long)]
     pub max_price: f64,
-    /// Base pubkey
+    /// 基础公钥 / Base public key
     #[clap(long)]
     pub base_pubkey: Pubkey,
-    /// Curvature
+    /// 曲率参数 / Curvature parameter
     #[clap(long)]
     pub curvature: f64,
-    /// position owner
+    /// 头寸所有者 / Position owner
     #[clap(long)]
     pub position_owner: Pubkey,
-    /// fee owner
+    /// 费用所有者 / Fee owner
     #[clap(long)]
     pub fee_owner: Pubkey,
-    /// lock release point
+    /// 锁定释放点 / Lock release point
     #[clap(long)]
     pub lock_release_point: u64,
-    /// Max retries
+    /// 最大重试次数 / Maximum retries
     #[clap(long)]
     pub max_retries: u16,
 }
 
+/// 执行操作员播种流动性
+/// Execute seed liquidity by operator
 pub async fn execute_seed_liquidity_by_operator<C: Deref<Target = impl Signer> + Clone>(
     params: SeedLiquidityByOperatorParameters,
     program: &Program<C>,
     transaction_config: RpcSendTransactionConfig,
     compute_unit_price: Option<Instruction>,
 ) -> Result<()> {
+    // 解构参数
+    // Destructure parameters
     let SeedLiquidityByOperatorParameters {
         lb_pair,
         base_position_path,
@@ -170,9 +219,13 @@ pub async fn execute_seed_liquidity_by_operator<C: Deref<Target = impl Signer> +
         ..
     } = params;
 
+    // 读取头寸基础密钥对文件
+    // Read position base keypair file
     let position_base_kp = read_keypair_file(base_position_path.clone())
         .expect("position base keypair file not found");
 
+    // 验证基础公钥是否匹配
+    // Verify base public key matches
     assert!(
         position_base_kp.pubkey() == base_pubkey,
         "base_pubkey mismatch"
@@ -180,14 +233,20 @@ pub async fn execute_seed_liquidity_by_operator<C: Deref<Target = impl Signer> +
 
     let rpc_client = program.rpc();
 
+    // 计算k值（曲率的倒数）用于流动性分布
+    // Calculate k value (reciprocal of curvature) for liquidity distribution
     let k = 1.0 / curvature;
 
+    // 获取流动性对状态
+    // Get liquidity pair state
     let lb_pair_state: LbPair = rpc_client
         .get_account_and_deserialize(&lb_pair, |account| {
             Ok(bytemuck::pod_read_unaligned(&account.data[8..]))
         })
         .await?;
 
+    // 获取bin步长
+    // Get bin step
     let bin_step = lb_pair_state.bin_step;
 
     let (mut bitmap_extension, _bump) = derive_bin_array_bitmap_extension(lb_pair);
@@ -712,6 +771,8 @@ pub async fn execute_seed_liquidity_by_operator<C: Deref<Target = impl Signer> +
     Ok(())
 }
 
+/// 获取特定bin的存款数量
+/// Get deposit amount for a specific bin
 fn get_bin_deposit_amount(
     amount: u64,
     bin_step: u16,
@@ -722,6 +783,8 @@ fn get_bin_deposit_amount(
     max_price: f64,
     k: f64,
 ) -> u64 {
+    // 计算下一个bin的累积函数值
+    // Calculate cumulative function value for next bin
     let c1 = get_c(
         amount,
         bin_step,
@@ -733,6 +796,8 @@ fn get_bin_deposit_amount(
         k,
     );
 
+    // 计算当前bin的累积函数值
+    // Calculate cumulative function value for current bin
     let c0 = get_c(
         amount,
         bin_step,
@@ -746,12 +811,16 @@ fn get_bin_deposit_amount(
 
     assert!(c1 > c0);
 
+    // 该bin的存款数量 = c1 - c0
+    // Deposit amount for this bin = c1 - c0
     let amount_into_bin = c1 - c0;
     amount_into_bin
 }
 
-// c(p) = 5 * 10^8 ((p - 0.1)/0.7) ^ 1.25, where P = ui price
-// c(p) = 5 * 10^8 ((p - min_price)/(max_price - min_price)) ^ 1.25
+/// 累积分布函数
+/// 公式: c(p) = amount * ((p - min_price)/(max_price - min_price))^k
+/// Cumulative distribution function
+/// Formula: c(p) = amount * ((p - min_price)/(max_price - min_price))^k
 fn get_c(
     amount: u64,
     bin_step: u16,
@@ -762,18 +831,28 @@ fn get_c(
     max_price: f64,
     k: f64,
 ) -> u64 {
+    // 计算每lamport价格
+    // Calculate price per lamport
     let price_per_lamport = (1.0 + bin_step as f64 / 10000.0).powi(bin_id);
 
+    // 计算当前用户界面价格
+    // Calculate current UI price
     let current_price =
         price_per_lamport * 10.0f64.powi(base_token_decimal as i32 - quote_token_decimal as i32);
 
+    // 价格范围和当前价格相对于最小价格的偏移
+    // Price range and current price offset from min price
     let price_range = max_price - min_price;
     let current_price_delta_from_min = current_price - min_price;
 
+    // 计算累积分布函数值
+    // Calculate cumulative distribution function value
     let c = amount as f64 * ((current_price_delta_from_min / price_range).powf(k));
     c as u64
 }
 
+/// 为每个bin生成流动性数量
+/// Generate liquidity amounts for each bin
 pub fn generate_amount_for_bins(
     bin_step: u16,
     min_bin_id: i32,
@@ -788,8 +867,11 @@ pub fn generate_amount_for_bins(
     let mut total_amount = 0;
     let mut bin_amounts = vec![];
 
-    // Last bin is purposely no included because for the last bin, c(last_bin +1) - c(last_bin) will > fund amount
+    // 最后一个bin故意不包括，因为对于最后一个bin，c(last_bin +1) - c(last_bin) 会 > 资金数量
+    // Last bin is purposely not included because for the last bin, c(last_bin +1) - c(last_bin) will > fund amount
     for bin_id in min_bin_id..max_bin_id {
+        // 计算该bin应该存入的数量
+        // Calculate the amount to be deposited in this bin
         let bin_amount = get_bin_deposit_amount(
             amount,
             bin_step,
@@ -802,10 +884,11 @@ pub fn generate_amount_for_bins(
         );
 
         bin_amounts.push((bin_id, bin_amount));
-
         total_amount += bin_amount;
     }
 
+    // 验证分配给bins的总数量等于资金数量
+    // Verify total amount distributed to bins equals funding amount
     assert_eq!(
         total_amount, amount,
         "Amount distributed to bins not equals to funding amount"

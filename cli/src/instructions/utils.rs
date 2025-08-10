@@ -1,3 +1,6 @@
+/// 通用工具函数模块
+/// Common utility functions module
+
 use std::collections::HashMap;
 
 use crate::*;
@@ -16,13 +19,21 @@ use solana_sdk::sysvar::clock::Clock;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 use spl_transfer_hook_interface::offchain::add_extra_account_metas_for_execute;
 
+/// 将头寸bin范围分块处理
+/// Chunk position bin ranges for processing
 pub fn position_bin_range_chunks(lower_bin_id: i32, upper_bin_id: i32) -> Vec<(i32, i32)> {
     let mut chunked_bin_range = vec![];
+    // 计算总的bin范围
+    // Calculate total bin range
     let bin_range = upper_bin_id - lower_bin_id + 1;
 
+    // 计算需要多少个分块
+    // Calculate how many chunks are needed
     let (quotient, remainder) = bin_range.div_rem(&(DEFAULT_BIN_PER_POSITION as i32));
     let chunk = quotient + (remainder != 0) as i32;
 
+    // 为每个分块计算bin ID范围
+    // Calculate bin ID range for each chunk
     for i in 0..chunk {
         let min_bin_id = lower_bin_id + DEFAULT_BIN_PER_POSITION as i32 * i;
         let max_bin_id = std::cmp::min(
@@ -36,6 +47,8 @@ pub fn position_bin_range_chunks(lower_bin_id: i32, upper_bin_id: i32) -> Vec<(i
     chunked_bin_range
 }
 
+/// 获取代币转账指令（支持SPL Token和Token-2022）
+/// Get token transfer instruction (supports SPL Token and Token-2022)
 #[allow(dead_code)]
 pub async fn get_transfer_instruction(
     from: Pubkey,

@@ -10,37 +10,41 @@ use spl_associated_token_account::instruction::create_associated_token_account_i
 
 use crate::*;
 
+/// 操作员在单个bin中播种流动性的参数结构体
+/// Parameters for seeding liquidity in a single bin by operator
 #[derive(Debug, Parser)]
 pub struct SeedLiquiditySingleBinByOperatorParameters {
-    /// Address of the pair
+    /// 流动性对的地址 / Address of the liquidity pair
     #[clap(long)]
     pub lb_pair: Pubkey,
-    /// Base position path
+    /// 基础头寸路径 / Base position path
     #[clap(long)]
     pub base_position_path: String,
-    /// Base position pubkey
+    /// 基础头寸公钥 / Base position public key
     #[clap(long)]
     pub base_pubkey: Pubkey,
-    /// amount of x
+    /// X代币的数量 / Amount of X token
     #[clap(long)]
     pub amount: u64,
-    /// price
+    /// 价格 / Price
     #[clap(long)]
     pub price: f64,
-    /// Position owner
+    /// 头寸所有者 / Position owner
     #[clap(long)]
     pub position_owner: Pubkey,
-    /// lock release point
+    /// 锁定释放点 / Lock release point
     #[clap(long)]
     pub lock_release_point: u64,
-    /// fee owner
+    /// 费用所有者 / Fee owner
     #[clap(long)]
     pub fee_owner: Pubkey,
-    /// Selective rounding
+    /// 选择性舍入 / Selective rounding
     #[clap(long)]
     pub selective_rounding: SelectiveRounding,
 }
 
+/// 执行操作员在单个bin中播种流动性
+/// Execute seeding liquidity in a single bin by operator
 pub async fn execute_seed_liquidity_single_bin_by_operator<
     C: Deref<Target = impl Signer> + Clone,
 >(
@@ -49,6 +53,8 @@ pub async fn execute_seed_liquidity_single_bin_by_operator<
     transaction_config: RpcSendTransactionConfig,
     compute_unit_price: Option<Instruction>,
 ) -> Result<()> {
+    // 解构参数
+    // Destructure parameters
     let SeedLiquiditySingleBinByOperatorParameters {
         lb_pair,
         base_position_path,
@@ -61,10 +67,14 @@ pub async fn execute_seed_liquidity_single_bin_by_operator<
         selective_rounding,
     } = params;
 
+    // 读取头寸基础密钥对文件
+    // Read position base keypair file
     let position_base_kp = Arc::new(
         read_keypair_file(base_position_path).expect("position base keypair file not found"),
     );
 
+    // 验证头寸基础密钥是否正确
+    // Verify position base key is correct
     assert_eq!(
         position_base_kp.pubkey(),
         base_pubkey,
@@ -74,28 +84,40 @@ pub async fn execute_seed_liquidity_single_bin_by_operator<
     let rpc_client = program.rpc();
     let operator = program.payer();
 
+    // 获取流动性对状态
+    // Get liquidity pair state
     let lb_pair_state: LbPair = rpc_client
         .get_account_and_deserialize(&lb_pair, |account| {
             Ok(bytemuck::pod_read_unaligned(&account.data[8..]))
         })
         .await?;
 
+    // 获取代币程序所有者
+    // Get token program owners
     let [token_x_owner, token_y_owner] = lb_pair_state.get_token_programs()?;
 
+    // 获取bin步长
+    // Get bin step
     let bin_step = lb_pair_state.bin_step;
 
+    // 获取操作员的X代币账户地址
+    // Get operator's X token account address
     let operator_token_x = get_associated_token_address_with_program_id(
         &operator,
         &lb_pair_state.token_x_mint,
         &token_x_owner,
     );
 
+    // 获取操作员的Y代币账户地址
+    // Get operator's Y token account address
     let operator_token_y = get_associated_token_address_with_program_id(
         &operator,
         &lb_pair_state.token_y_mint,
         &token_y_owner,
     );
 
+    // 获取头寸所有者的X代币账户地址
+    // Get position owner's X token account address
     let owner_token_x = get_associated_token_address_with_program_id(
         &position_owner,
         &lb_pair_state.token_x_mint,
@@ -133,10 +155,14 @@ pub async fn execute_seed_liquidity_single_bin_by_operator<
     )?
     .amount;
 
+    // 将价格转换为每lamport价格
+    // Convert price to per-lamport price
     let price =
         price_per_token_to_per_lamport(price, token_mint_base.decimals, token_mint_quote.decimals)
             .context("price_per_token_per_lamport overflow")?;
 
+    // 根据选择性舍入方式计算bin ID
+    // Calculate bin ID based on selective rounding
     let bin_id = match selective_rounding {
         SelectiveRounding::None => get_precise_id_from_price(bin_step, &price)
             .context("fail to get exact bin id for the price"),
