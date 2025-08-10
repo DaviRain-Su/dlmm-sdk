@@ -180,6 +180,27 @@ impl Core {
     pub async fn init_user_ata(&self) -> Result<()> {
         if let Some(wallet) = self.wallet.as_ref() {
             let rpc_client = self.rpc_client();
+            
+            // 先获取所有交易对的信息
+            let mut wsol_needed = 0u64;
+            let mut pair_infos = vec![];
+            
+            for pair_config in &self.config {
+                let pair_address = Pubkey::from_str(&pair_config.pair_address)?;
+                match rpc_client
+                    .get_account_and_deserialize::<LbPair>(&pair_address, |account| {
+                        anyhow::Result::Ok(bytemuck::pod_read_unaligned(&account.data[8..]))
+                    })
+                    .await {
+                    anyhow::Result::Ok(lb_pair_state) => {
+                        pair_infos.push((pair_address, lb_pair_state));
+                    },
+                    anyhow::Result::Err(_) => {
+                        warn!("Failed to get pair info for {}", pair_address);
+                    }
+                }
+            }
+            
             for (token_mint, program_id) in self.get_all_token_mints_with_program_id()?.iter() {
                 // 创建ATA账户
                 let ata = get_or_create_ata(
@@ -191,22 +212,53 @@ impl Core {
                 )
                 .await?;
                 
-                // 如果是WSOL且余额为0，自动包装一些SOL
+                // 如果是WSOL，检查是否需要包装
                 if *token_mint == token::spl_token::native_mint::id() {
                     let ata_account = rpc_client.get_account(&ata).await?;
                     let token_account = TokenAccount::try_deserialize(&mut ata_account.data.as_ref())?;
                     
-                    if token_account.amount == 0 {
-                        info!("Wrapping SOL to WSOL...");
-                        // 获取配置中需要的X代币数量
-                        let mut needed_amount = 0u64;
-                        for pair_config in &self.config {
-                            needed_amount = needed_amount.max(pair_config.x_amount);
+                    // 查找需要的WSOL数量（正确检查Y代币）
+                    for (i, pair_config) in self.config.iter().enumerate() {
+                        if i < pair_infos.len() {
+                            let (pair_address, lb_pair_state) = &pair_infos[i];
+                            
+                            // 重要：Y代币是WSOL！
+                            if lb_pair_state.token_y_mint == *token_mint {
+                                wsol_needed = wsol_needed.max(pair_config.y_amount);
+                                info!("Pair {} has WSOL as Y token, needs {} WSOL", 
+                                    pair_address, pair_config.y_amount as f64 / 1e9);
+                            }
+                            // 如果X代币是WSOL（通常不是这种情况）
+                            else if lb_pair_state.token_x_mint == *token_mint {
+                                wsol_needed = wsol_needed.max(pair_config.x_amount);
+                                info!("Pair {} has WSOL as X token, needs {} WSOL", 
+                                    pair_address, pair_config.x_amount as f64 / 1e9);
+                            }
                         }
+                    }
+                    
+                    // 检查余额并包装
+                    if token_account.amount < wsol_needed && wsol_needed > 0 {
+                        let wrap_amount = wsol_needed - token_account.amount;
                         
-                        if needed_amount > 0 {
-                            self.wrap_sol(needed_amount).await?;
+                        // 检查SOL余额是否足够
+                        let sol_balance = rpc_client.get_balance(&wallet.pubkey()).await?;
+                        let required_sol = wrap_amount + 10_000_000; // 加上一些手续费
+                        
+                        if sol_balance < required_sol {
+                            warn!("Insufficient SOL balance. Have: {} SOL, need: {} SOL", 
+                                sol_balance as f64 / 1e9, required_sol as f64 / 1e9);
+                            warn!("Skipping WSOL wrapping. Please add more SOL or reduce y_amount in config.");
+                            // 不要抛出错误，继续运行
+                        } else {
+                            info!("Current WSOL balance: {} SOL, needed: {} SOL, wrapping {} SOL", 
+                                token_account.amount as f64 / 1e9, 
+                                wsol_needed as f64 / 1e9, 
+                                wrap_amount as f64 / 1e9);
+                            self.wrap_sol(wrap_amount).await?;
                         }
+                    } else {
+                        info!("WSOL balance sufficient: {} SOL", token_account.amount as f64 / 1e9);
                     }
                 }
             }
